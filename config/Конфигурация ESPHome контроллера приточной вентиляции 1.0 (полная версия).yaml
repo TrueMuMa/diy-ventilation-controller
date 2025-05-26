@@ -1,0 +1,1350 @@
+substitutions:
+  version: "1_0"
+
+esphome:
+  name: supply-ventilation-controller
+  friendly_name: supply-ventilation-controller-${version}
+  on_boot:
+    priority: 600
+    then:
+      - component.update: power_status_sensor # Принудительно обновляем сенсор активной обмотки вентилятора при включении
+      - delay: 2s
+
+esp32:
+  board: esp32dev # Укажите тип вашей платы ESP
+  framework:
+    type: arduino
+    
+preferences:
+    # Увеличиваем интервал записи в память до 10 минут 
+    flash_write_interval: 10min
+
+globals:
+  - id: fan_speed_percent # Переменная для хранения значений итоговой выходной скорости вентилятора в процентах
+    type: float
+    initial_value: '0.0'
+  - id: smoke_threshold # Процент уровень дыма для срабатывания аварийного режима
+    type: float
+    restore_value: true
+    initial_value: "60.0"
+  - id: emergency_bypass # Состояние аварийного проветривание (проверка уровня дыма)
+    type: bool
+    initial_value: 'false'
+  - id: last_ventilation # Последняя проверка уровня дыма
+    type: int
+    initial_value: '0'
+  - id: emergency_start_time # Время начала аварийного режима
+    type: int
+    initial_value: '0'
+  - id: power_switch_temp # Температура перехода на HIGH-SPEED обмотку
+    type: float
+    restore_value: true
+    initial_value: "20.0"
+  - id: power_switch_speed # Скорость в момент переключения на HIGH-SPEED обмотку (для расчет коэффициента коррекции автоскорости)
+    type: float
+    initial_value: '0.0'
+  - id: semi_auto_speed # Скорость в полуавтоматическом режиме
+    type: float
+    initial_value: "5.0"
+    restore_value: true
+  - id: semi_auto_duration # Продолжительность полуавтоматического режима в минутах
+    type: int
+    initial_value: "10"
+    restore_value: true
+  - id: semi_auto_duration_sec # Переменная расчета времени полуавтоматического режима в секундах
+    type: uint32_t
+    restore_value: no
+    initial_value: "0" 
+  - id: semi_auto_active # Переменная активности полуавтоматического режима
+    type: bool
+    initial_value: 'false'
+  - id: semi_auto_start_time # Прошедшее время со старта полуавтоматического режима
+    type: uint32_t
+    initial_value: "0"
+    restore_value: no
+  - id: last_requested_speed # Переменная для отслеживания последней запрошенной скорости в режиме разгона (speedup)
+    type: float
+    initial_value: '0.0'
+  - id: speedup_active # Переменная активности режима разгона
+    type: bool
+    initial_value: 'false'
+  - id: grace_period_active # Переменная для отсчета защитного периода (10 сек при старте)
+    type: bool
+    initial_value: 'false'
+  - id: display_active  # Состояние активности дисплея
+    type: bool
+    initial_value: 'true'
+  - id: display_timeout_counter  # Хранение таймера активности дисплея
+    type: int
+    initial_value: '0'
+  - id: target_co2_value  # Переменная хранения целевого уровня CO2
+    type: float
+    restore_value: true 
+    initial_value: "600.0"
+  # Хранение температурных точек лимита оборотов вентилятора
+  - id: temp_0_limit
+    type: float
+    restore_value: true
+    initial_value: "2.0"
+  - id: temp_5_limit
+    type: float
+    restore_value: true
+    initial_value: "7.0"
+  - id: temp_10_limit
+    type: float
+    restore_value: true
+    initial_value: "10.0"
+  - id: temp_15_limit
+    type: float
+    restore_value: true
+    initial_value: "18.0"
+  - id: temp_20_limit
+    type: float
+    restore_value: true
+    initial_value: "40.0"
+  - id: temp_25_limit
+    type: float
+    restore_value: true
+    initial_value: "80.0"
+  - id: temp_30_limit
+    type: float
+    restore_value: true
+    initial_value: "10.0"
+
+number:
+# Температурные точки лимита оборотов вентилятора
+  - platform: template
+    name: "Temp 0°C Fan Limit"
+    id: temp_0_limit_num
+    icon: "mdi:thermometer-minus"
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: id(temp_0_limit) = x;
+        - component.update: current_temp_limit
+
+  - platform: template
+    name: "Temp 5°C Fan Limit"
+    id: temp_5_limit_num
+    icon: "mdi:thermometer-minus"
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: id(temp_5_limit) = x;
+        - component.update: current_temp_limit
+
+  - platform: template
+    name: "Temp 10°C Fan Limit"
+    id: temp_10_limit_num
+    icon: "mdi:thermometer-minus"
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: id(temp_10_limit) = x;
+        - component.update: current_temp_limit
+
+  - platform: template
+    name: "Temp 15°C Fan Limit"
+    id: temp_15_limit_num
+    icon: "mdi:thermometer-minus"
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: id(temp_15_limit) = x;
+        - component.update: current_temp_limit
+
+  - platform: template
+    name: "Temp 20°C Fan Limit"
+    id: temp_20_limit_num
+    icon: "mdi:thermometer-minus"
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: id(temp_20_limit) = x;
+        - component.update: current_temp_limit
+
+  - platform: template
+    name: "Temp 25°C Fan Limit"
+    id: temp_25_limit_num
+    icon: "mdi:thermometer-minus"
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: id(temp_25_limit) = x;
+        - component.update: current_temp_limit
+
+  - platform: template
+    name: "Temp 30°C Fan Limit"
+    id: temp_30_limit_num
+    icon: "mdi:thermometer-minus"
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: id(temp_30_limit) = x;
+        - component.update: current_temp_limit
+
+  - platform: template
+    name: "Target CO₂ Level"
+    id: target_co2
+    icon: "mdi:molecule-co2"
+    min_value: 500
+    max_value: 1000
+    step: 50
+    initial_value: 600
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: id(target_co2_value) = x;
+        - component.update: co2_required_speed
+# Скорость в полуавтоматическом режиме
+  - platform: template
+    name: "Semi-Auto Fan Speed"
+    id: semi_auto_speed_num
+    icon: "mdi:fan-plus"
+    min_value: 0
+    max_value: 100
+    step: 1
+    restore_value: true
+    optimistic: true
+    initial_value: 1
+    set_action:
+        - lambda: id(semi_auto_speed) = x;
+        - component.update: fan_status
+# Продолжительность работы полуавтоматического режима
+  - platform: template
+    name: "Semi-Auto Mode Duration"
+    id: semi_auto_duration_num
+    icon: "mdi:fan-clock"
+    min_value: 1
+    max_value: 600
+    step: 1
+    restore_value: true
+    optimistic: true
+    initial_value: 1
+    set_action:
+        - lambda: id(semi_auto_duration) = x;
+        - component.update: fan_status
+# Температура переключение обмотки вентилятора
+  - platform: template
+    name: "Fan Power Switch Temperature"
+    id: power_switch_temp_num
+    icon: "mdi:temperature-celsius"
+    min_value: 0
+    max_value: 30
+    step: 1
+    unit_of_measurement: "°C"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: id(power_switch_temp) = x;
+        - component.update: auto_fan_speed
+# Порог сработки аварийного режима по датчику дыма
+  - platform: template
+    name: "Smoke Emergency Threshold"
+    id: smoke_threshold_num
+    icon: "mdi:smoke-detector-alert-outline"
+    min_value: 10
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            id(smoke_threshold) = x;
+            id(smoke_emergency_sensor).publish_state(id(smoke_emergency_sensor).state);
+
+# Основной селектор режимов работы контроллера
+select:
+  - platform: template
+    name: "System Mode"
+    id: mode_select
+    icon: "mdi:auto-mode"
+    optimistic: true
+    options:
+      - "auto"
+      - "manual"
+      - "semi_auto"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x == "auto";'
+            then:
+              - lambda: |-
+                  // Синхронизация скорости
+                  bool current_power_state = id(power_auto_condition).state;
+                  id(power_auto_condition).publish_state(!current_power_state);
+                  id(power_auto_condition).publish_state(current_power_state);
+                  id(auto_fan_speed).update();
+
+                  // Создаем и настраиваем вызов
+                  auto call = id(fan_controller).make_call();
+
+                  if (id(auto_fan_speed).state > 0) {
+                    call.set_state(true);
+                    call.set_speed(id(auto_fan_speed).state);
+                  } else {
+                    call.set_state(false);
+                  }
+                  call.perform(); // Применяем изменения
+
+                  // Обновление физического выхода
+                  id(pwm_output).set_level(id(auto_fan_speed).state / 100.0);
+
+                  // Сброс параметров полуавтомата при активации авторежима
+                  id(semi_auto_active) = false;
+                  id(semi_auto_start_time) = 0;
+                  id(semi_auto_duration_sec) = 0;
+                  id(remaining_time).publish_state(0);
+
+                  // Форсированное обновление интерфейса
+                  id(fan_status).update();
+                  id(fan_speed_sensor).update();
+        - if:
+            condition:
+              lambda: 'return x == "manual";'
+            then:
+              - lambda: |-
+                  id(fan_status).update(); // Обновляю текстовый статус вентилятора
+                  id(fan_controller).turn_on(); // Явное включение ручного управления
+
+                  // Сброс параметров полуавтомата
+                  id(semi_auto_active) = false;
+                  id(semi_auto_start_time) = 0;
+                  id(semi_auto_duration_sec) = 0;
+                  id(remaining_time).publish_state(0);
+        - if:
+            condition:
+              lambda: 'return x == "semi_auto";'
+            then:
+              - lambda: |-
+                  if (id(semi_auto_duration) > 0) {
+
+                    id(semi_auto_duration_sec) = id(semi_auto_duration) * 60;
+                    id(semi_auto_start_time) = millis() / 1000;
+                    id(semi_auto_active) = true;
+
+                    auto call = id(fan_controller).make_call();
+                    call.set_state(true);
+                    call.set_speed(id(semi_auto_speed));
+                    call.perform();
+
+                    id(pwm_output).set_level(id(semi_auto_speed) / 100.0);
+
+                    id(fan_controller).turn_on(); // Синхронизация компонента fan
+                    id(fan_status).update(); // Обновляю текстовый статус вентилятора
+                    id(remaining_time).update(); // Обновляю сенсор оставшегося времени режима
+                  }
+                  else {
+                    auto call = id(mode_select).make_call();  // Откат при невалидных условиях
+                    call.set_option("auto");
+                    call.perform();
+                  }
+
+switch:
+  # Физическое реле переключения обмоток (только для управления автоматическим режимом)
+  - platform: gpio
+    name: "High Power Fan Relay"
+    id: high_power_relay
+    pin: GPIO26
+    restore_mode: ALWAYS_OFF
+    internal: true # Скрываем прямое управление в Home Assistant
+
+  # Виртуальный переключатель обмоток для ручного и полуавтоматического управления
+  - platform: template
+    name: "High Power Fan Mode"
+    id: manual_high_power_fan_control
+    icon: "mdi:swap-horizontal"
+    lambda: |-
+      // Всегда синхронизировано с реальным реле
+      return id(high_power_relay).state;
+    turn_on_action:
+      - if:
+          condition:
+            lambda: 'return id(mode_select).state != "auto";'
+          then:
+            - switch.turn_on: high_power_relay
+            - lambda: |-
+                ESP_LOGD("COIL", "Manual HIGH power activation");
+            - component.update: power_status_sensor
+            - component.update: fan_status
+    turn_off_action:
+      - if:
+          condition:
+            lambda: 'return id(mode_select).state != "auto";'
+          then:
+            - switch.turn_off: high_power_relay
+            - lambda: |-
+                ESP_LOGD("COIL", "Manual LOW power activation");
+            - component.update: power_status_sensor
+            - component.update: fan_status
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  id: ha_api # Присвоен ID для отслеживания состояния подключения
+  encryption:
+    key: "xxxxxxxxxxxxxxxxxx" # Ваш API ключ (генерируется при создании конфигурации)
+
+ota:
+  - platform: esphome
+    password: "97d2b8824089d906786aec490fe50aed" # Ваш OTA-пароль (генерируется при создании конфигурации)
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Supply-Ventilation-Controller"
+    password: "xxxxxxxx"  # Пароль точки доступа (генерируется при создании конфигурации)
+
+  # Задайте ваши параметры сети
+  manual_ip:
+    static_ip: 192.168.1.100
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+
+captive_portal:
+
+# Настройка шины 1-Wire для датчика температуры DS18B20
+one_wire:
+  - platform: gpio
+    pin: GPIO4
+
+# Настройка шины I2C
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  frequency: 400kHz
+
+# Шрифты
+font:
+  - file: "gfonts://Roboto+Mono"
+    id: font_large
+    size: 16
+    glyphs: " !%()+-.:/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°|" 
+  - file: "gfonts://Roboto+Mono"
+    id: font_medium
+    size: 14
+    glyphs: " !%()+-.:/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°|"
+  - file: "gfonts://Roboto+Mono"
+    id: font_small
+    size: 12
+    glyphs: " !%()+-.:/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°|"
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    id: oled_display
+    update_interval: 2s
+    lambda: |-
+      if (id(display_active)) {
+        // Line 1: CO₂ и температура
+        it.printf(0, 0, id(font_medium), "CO2:%-4.0f|T:%-4.1fC", 
+            id(co2_level).state, 
+            id(incoming_temp).state);
+
+        // Line 2: Режим и скорость
+        const char* mode = "AUTO";
+        if (id(mode_select).state == "manual") mode = "MAN";
+        else if (id(mode_select).state == "semi_auto") mode = "SEMI";
+        if (id(smoke_emergency_sensor).state) mode = "SMOKE";
+        it.printf(0, 12, id(font_medium), "Mode:%-4s|%3d%%",
+            mode,
+            (int)id(fan_speed_sensor).state);
+
+        // Line 3: Источник управления
+        char line3[21];
+        if (id(smoke_emergency_sensor).state) {
+          snprintf(line3, sizeof(line3), "EMERGENCY");
+        }
+        else if (id(mode_select).state == "semi_auto") {
+          int remaining = (int)id(remaining_time).state; // Явное приведение к int
+          snprintf(line3, sizeof(line3), "Remaining: %02d:%02d", 
+                  remaining / 60, 
+                  remaining % 60); // Теперь работает с целыми числами
+        }
+        else if (id(mode_select).state == "manual") {
+          snprintf(line3, sizeof(line3), "Manual fan speed");
+        }
+        else {
+          float co2_speed = id(co2_required_speed).state;
+          float temp_speed = id(current_temp_limit).state;
+          const char* source = (co2_speed < temp_speed) ? "CO2" : "TEMP";
+          snprintf(line3, sizeof(line3), "Source: %s", source);
+        }
+        it.printf(0, 26, id(font_medium), "%-18s", line3);
+
+        // Line 4: Статус подключения к HA и мощность
+        it.printf(0, 40, id(font_small), "HA:%s|FAN PWR:%s",
+            id(ha_api).is_connected() ? "ON " : "OFF",
+            id(high_power_relay).state ? "HIGH" : "LOW");
+      } else {
+        it.clear();
+      }
+
+sensor:
+# Датчик дыма MQ-2
+  - platform: adc
+    id: smoke_level
+    pin: GPIO33
+    name: "Smoke Level"
+    update_interval: 3s
+    filters:
+      - sliding_window_moving_average: 
+          window_size: 5  # Увеличьте окно для лучшего сглаживания
+          send_every: 5
+      - calibrate_linear:
+          - 0.018 -> 0.0    # Чистый воздух (0.1V → 0%)
+          - 0.075 -> 100.0  # Полное задымление (0.8V → 100%)
+      - clamp:  # Ограничиваем диапазон значений
+          min_value: 0.0
+          max_value: 90.0
+      - delta: 1
+    unit_of_measurement: "%"
+    icon: "mdi:percent"
+
+# Датчик температуры
+  - platform: dallas_temp
+    name: "Incoming air temperature (DS18B20)"
+    device_class: temperature
+    id: incoming_temp
+    address: 0x2f000000beed3228
+    accuracy_decimals: 1
+    unit_of_measurement: "°C"
+    update_interval: 20s
+    icon: mdi:thermometer
+    filters:
+      - delta: 0.1
+    on_value:
+      then:
+        - lambda: |-
+            id(power_auto_condition).publish_state(id(power_auto_condition).state); // Сенсор температуры обмоток
+            id(current_temp_limit).update(); // Обновляю лимит по температуре
+            
+# Данные CO₂ из сенсора Home Assistant
+  - platform: homeassistant
+    id: co2_level_ha
+    name: "CO₂ Level HA Data"
+    entity_id: sensor.co2_level # Сущность сенсора в Home Assistant
+    unit_of_measurement: "ppm"
+    accuracy_decimals: 0
+    internal: true
+    filters:
+      - delta: 0.1
+    on_value:
+      then:
+      - component.update: co2_level
+
+# Обработка значений уровня CO₂ с принудительным возвратом NaN при недоступности Home Assistant
+  - platform: template
+    id: co2_level
+    name: "CO₂ Level"
+    unit_of_measurement: "ppm"
+    accuracy_decimals: 0
+    icon: mdi:molecule-co2
+    internal: true
+    lambda: |-
+      if (id(ha_connection).state) {
+        return id(co2_level_ha).state;
+      } else {
+        return NAN;
+      }
+    on_value:
+      then:
+      - component.update: co2_required_speed
+
+# Сенсор расчета требуемой скорости по CO₂
+  - platform: template
+    name: "CO₂ Required Speed"
+    id: co2_required_speed
+    unit_of_measurement: "%"
+    icon: mdi:molecule-co2
+    accuracy_decimals: 0
+    update_interval: never
+    lambda: |-
+      static int last_speed = -1;
+      const float current = id(co2_level).state;
+      const float target = id(target_co2_value);
+      bool ha_connected = id(ha_connection).state;  // Проверка подключения HA
+
+      // Аварийные ситуации
+      if (!ha_connected || isnan(current) || current < 400 || current > 5000) {
+        ESP_LOGD("CO2", "Некорректные данные CO2 или HA отключен: %.0f ppm", current);
+        return 100;
+      }
+
+      // Проверка гистерезиса
+      if (!id(co2_high).state) {
+        // Всё в норме - скорость 0%
+        if (last_speed != 0) {
+          ESP_LOGD("CO2", "CO2 нормальный. Скорость: 0%%");
+          last_speed = 0;
+        }
+        return 0;
+      }
+
+      // Активное регулирование
+      const float overshoot = current - target;
+      int speed = static_cast<int>((overshoot * 100.0f) / target + 0.5f);
+      speed = (speed < 5) ? 5 : (speed > 100) ? 100 : speed;
+
+      if (speed == last_speed) return {};
+      last_speed = speed;
+
+      ESP_LOGD("CO2", "Скорость по CO2: %d%%", speed);
+      return speed;
+    on_value:
+      then:
+      - component.update: auto_fan_speed
+    filters:
+      - delta: 1
+
+  # Сенсор расчета текущего температурного лимита
+  - platform: template
+    name: "Temp Limit Speed"
+    id: current_temp_limit
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: mdi:thermometer-lines
+    update_interval: never
+    lambda: |-
+      float temp = id(incoming_temp).state;
+      
+      // Проверка на ошибку датчика
+      if (temp <= -55.0 || temp >= 85.0) {
+        ESP_LOGE("TEMP", "Некорретная температура: %.1f! Проверь датчик. Вентиляция отключена, 0%%", temp);
+        return 0.0;
+      }
+
+      // Граничные значения
+      if (temp <= 0) return round(id(temp_0_limit));
+      if (temp >= 30) return round(id(temp_30_limit));
+      
+      // Определяем ближайшие точки
+      int lower = static_cast<int>(temp / 5) * 5;
+      int upper = lower + 5;
+      
+      // Получаем значения из глобальных переменных
+      float lower_val = round(
+        lower == 0 ? id(temp_0_limit) :
+        lower == 5 ? id(temp_5_limit) :
+        lower == 10 ? id(temp_10_limit) :
+        lower == 15 ? id(temp_15_limit) :
+        lower == 20 ? id(temp_20_limit) :
+        lower == 25 ? id(temp_25_limit) : 0.0
+      );
+      
+      float upper_val = round(
+        upper == 5 ? id(temp_5_limit) :
+        upper == 10 ? id(temp_10_limit) :
+        upper == 15 ? id(temp_15_limit) :
+        upper == 20 ? id(temp_20_limit) :
+        upper == 25 ? id(temp_25_limit) :
+        upper == 30 ? id(temp_30_limit) : 0.0
+      );
+      
+      // Линейная интерполяция с округлением результата
+      float ratio = (temp - lower) / 5.0;
+      return round(lower_val * (1 - ratio) + upper_val * ratio);
+    on_value:
+      then:
+      - component.update: auto_fan_speed
+    filters:
+      - delta: 1
+
+  # Сенсор расчета итоговой автоскорости
+  - platform: template
+    name: "Auto Fan Speed"
+    id: auto_fan_speed
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: mdi:fan-auto
+    update_interval: never
+    lambda: |-
+      // Блокировка скорости только если авария активна и не в режиме проверки дыма
+      if (id(smoke_emergency_sensor).state && !id(emergency_bypass)) {
+        return 0.0f;
+      }
+
+      bool ha_connected = id(ha_connection).state;
+      bool co2_ok = ha_connected && !isnan(id(co2_level).state) && (id(co2_level).state > 400);  // Добавлена проверка HA
+      bool temp_ok = !isnan(id(incoming_temp).state) && (id(incoming_temp).state > -55);
+      
+      if (!co2_ok && !temp_ok) return 0.0f;
+      
+      float co2_speed = co2_ok ? id(co2_required_speed).state : 100.0f;
+      float temp_speed = temp_ok ? id(current_temp_limit).state : 100.0f;
+      
+      float base_speed = fmin(co2_speed, temp_speed);
+
+      // Динамическая коррекция для HIGH обмотки (для снижения скачков воздуха при переключении обмоток)
+      if (id(high_power_relay).state && id(mode_select).state == "auto") {
+        // Рассчитываем коэффициент уменьшения
+        float min_speed = fmin(base_speed, id(power_switch_speed));
+        float ratio = (base_speed - min_speed) / (100.0f - min_speed);
+        ratio = fmax(ratio, 0.0f);
+
+        // Квадратичное изменение коэффициента уменьшения скорости с 1.4 до 1.0
+        float factor = 1.4f - (0.4f * powf(ratio, 2));
+
+        // Применяем коррекцию
+        base_speed = base_speed / factor;
+
+        // Ограничиваем максимум 100%
+        base_speed = fmin(base_speed, 100.0f);
+      }
+      return roundf(base_speed);
+    on_value:
+      then:
+        - if:
+            condition:
+                lambda: |-
+                  return id(mode_select).state == "auto"; // Применяем только в Авторежиме
+            then:
+              - output.set_level:   # Установка фактической скорости на PWM выходе
+                  id: pwm_output
+                  level: !lambda 'return id(auto_fan_speed).state / 100.0;'
+              - component.update: fan_status # Обновляю текстовый статус вентилятора
+              - if:   # Ниже условия для синхронизации компонента fan
+                  condition:
+                    lambda: 'return id(auto_fan_speed).state > 0;'
+                  then:
+                    - fan.turn_on:
+                        id: fan_controller
+                        speed: !lambda 'return id(auto_fan_speed).state;'
+                  else:
+                    - fan.turn_off: fan_controller
+    filters:
+      - delta: 1
+
+  # Сенсор фактической скорости вентилятора в процентах
+  - platform: template
+    name: "Fan Speed"
+    id: fan_speed_sensor
+    icon: mdi:fan
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    lambda: |-
+      return id(fan_speed_percent);
+    update_interval: never
+
+  # Оставшееся время полуавтоматического режима (необязательный)
+  - platform: template
+    name: "Remaining Semi-Auto Mode Time"
+    id: remaining_time
+    icon: mdi:timelapse
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      if (id(mode_select).state != "semi_auto") return {};
+      const uint32_t now = millis();
+      return id(semi_auto_duration_sec) - ((now / 1000) - id(semi_auto_start_time));
+
+binary_sensor:
+# Сенсор работы вентилятора
+  - platform: template
+    name: "Fan Operating"
+    id: fan_working_sensor
+    lambda: |-
+      return id(fan_speed_percent) > 0.0;
+    icon: "mdi:fan"    
+
+# Сенсор активности режима разгона
+  - platform: template
+    device_class: running
+    name: "Speedup Active"
+    lambda: 'return id(speedup_active);'
+    icon: "mdi:rocket-launch"
+
+# Сенсор гистерезиса для целевого CO2 (проверяется при расчете скорости по CO2)
+  - platform: template
+    name: "CO₂ High"
+    id: co2_high
+    internal: true
+    lambda: |-
+      static bool last_state = false;
+      const float target = id(target_co2_value);
+      const float current = id(co2_level).state;
+      
+      if (isnan(current)) return last_state;
+      
+      float upper = target * 1.10; //запуск выше 10% от цели
+      float lower = target * 0.95; //остановка ниже 5% от цели
+      
+      if (current >= upper && !last_state) {
+        last_state = true;
+      } else if (current <= lower && last_state) {
+        last_state = false;
+      }
+      return last_state;
+    on_state:
+      then:
+        - component.update: co2_required_speed
+
+# Логика переключения обмоток с гистерезисом
+  - platform: template
+    id: power_auto_condition
+    internal: true
+    lambda: |-
+      float current_temp = id(incoming_temp).state;
+      float switch_temp = id(power_switch_temp);
+      float hysteresis = 1.0; // гистерезис 1 градус
+      static bool last_state = false;
+
+      // Определение нового состояния с гистерезисом
+      bool new_state = last_state;
+      if (current_temp > (switch_temp + hysteresis)) {
+        new_state = true;
+      } else if (current_temp < (switch_temp - hysteresis)) {
+        new_state = false;
+      }
+
+      // Обновление состояния при изменении
+      if (new_state != last_state) {
+        last_state = new_state;
+        id(power_switch_speed) = id(auto_fan_speed).state;
+        ESP_LOGD("ОБМОТКА", "Speed changed to: %.1f%%", id(power_switch_speed));
+      }
+
+      return new_state;
+    on_state:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                return (id(mode_select).state == "auto") 
+                && (x != id(high_power_relay).state);
+            then:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then:
+                    - switch.turn_on: high_power_relay
+                  else:
+                    - switch.turn_off: high_power_relay
+              - lambda: |-
+                  id(auto_fan_speed).update();
+                  ESP_LOGD("COIL", "Auto-switch to %s", x ? "HIGH" : "LOW");
+        - component.update: power_status_sensor # Обновляем сенсор текущей обмотки
+        - component.update: fan_status # Обновляем общий статус
+
+# Аварийная блокировка при превышении уровня дыма
+  - platform: template
+    id: smoke_emergency_sensor
+    name: "Smoke Emergency Mode"
+    icon: mdi:alert
+    device_class: problem
+    lambda: |-
+      float current_smoke = id(smoke_level).state;
+      float threshold = id(smoke_threshold);
+      float hysteresis = 10.0; // гистерезис 10%
+      
+      static bool last_state = false;
+      bool new_state = last_state;
+      
+      if (current_smoke >= threshold) {
+        new_state = true;
+      } else if (current_smoke <= (threshold - hysteresis)) {
+        new_state = false;
+      }
+      
+      if (new_state != last_state) {
+        id(last_ventilation) = 0;
+        id(emergency_bypass) = false;
+        last_state = new_state;
+      }
+      return new_state;
+    on_state:
+      then:
+        - lambda: |-
+            if (x) {  // Если сработала авария
+              // Принудительно переключаемся в auto, если текущий режим не auto
+              if (id(mode_select).state != "auto") {
+                auto call = id(mode_select).make_call();
+                call.set_option("auto");
+                call.perform();
+              }
+              id(auto_fan_speed).update(); // Принудительное обновление автоскорости
+            } 
+
+# Кнопка активации дисплея
+  - platform: gpio
+    pin: 
+      number: GPIO23
+      mode: INPUT_PULLUP  # Используем внутреннюю подтяжку к питанию
+      inverted: true      # Инвертируем логику
+    name: "Display Activation Button"
+    internal: true
+    filters:
+      - delayed_on: 50ms  # Фильтр дребезга
+      - delayed_off: 50ms
+    on_press:
+      then:
+        - lambda: |-
+            id(display_timeout_counter) = 0;
+            id(display_active) = true;
+            id(oled_display).update();
+
+# Действия при отключении от HA
+  - platform: template
+    name: "HA Online Status"
+    id: ha_connection
+    device_class: connectivity
+    lambda: |-
+      return id(ha_api).is_connected();
+    on_state:
+      then:
+        - component.update: co2_required_speed
+        - if:
+            condition:
+              lambda: 'return !x;'  # Проверка потери связи
+            then:
+              - delay: 30s  # Задержка для фильтрации кратковременных разрывов
+              - if:
+                  condition:
+                    lambda: 'return !id(ha_api).is_connected();'
+                  then:
+                    - select.set:  # Принудительный переход в авто-режим
+                        id: mode_select
+                        option: "auto"
+                    - logger.log: "Связь с HA потеряна. Режим: Auto"
+                    - component.update: auto_fan_speed  # Обновление скорости
+
+text_sensor:
+  # Сенсор активной обмотки
+  - platform: template
+    name: "Current Fan Power"
+    id: power_status_sensor
+    icon: "mdi:fan-plus"
+    lambda: |-
+      if (id(high_power_relay).state) {
+        return std::string("Высокая");
+      } else {
+        return std::string("Обычная");
+      }
+    update_interval: never
+
+  # Общий статус
+  - platform: template
+    name: "System Status"
+    id: fan_status
+    lambda: |-
+      static std::string last_status = "";
+      std::string current_status;
+      std::string power_status = id(high_power_relay).state ? 
+                              "/ Мощность: высокая" : 
+                              "/ Мощность: обычная";
+      unsigned long now = millis();
+      bool emergency_active = id(smoke_emergency_sensor).state;
+
+      // Speedup и Защитный период - наивысший приоритет
+      if (id(speedup_active)) {
+        current_status = "Разгон (" + std::to_string(static_cast<int>(id(fan_speed_sensor).state)) + "%) " + power_status;
+      }
+      else if (id(grace_period_active)) {
+        current_status = "Защитный период (" + std::to_string(static_cast<int>(id(fan_speed_sensor).state)) + "%) " + power_status;
+      }
+      // Аварийный режим (третий приоритет)
+      else if (emergency_active) {
+        std::string mode_info;
+        char buffer[30];
+        bool show_timers = true;
+
+        // Если активен ручной режим - показываем только метку
+        if (id(mode_select).state == "manual") {
+          mode_info = " [Ручной режим]";
+          show_timers = false;
+        }
+        
+        // Если таймеры разрешены - вычисляем время
+        if (show_timers) {
+          if (id(mode_select).state == "semi_auto") {
+            uint32_t elapsed_seconds = (now / 1000) - id(semi_auto_start_time);
+            uint32_t remaining = (elapsed_seconds < id(semi_auto_duration_sec)) 
+                                ? (id(semi_auto_duration_sec) - elapsed_seconds) 
+                                : 0;
+            snprintf(buffer, sizeof(buffer), "%02lu:%02lu", remaining / 60, remaining % 60);
+            mode_info = " [Полуавтомат: " + std::string(buffer) + "]";
+          }
+          else if (id(emergency_bypass)) {
+            uint32_t emergency_elapsed = (now - id(last_ventilation)) / 1000;
+            uint32_t emergency_remaining = (30 > emergency_elapsed) ? (30 - emergency_elapsed) : 0;
+            snprintf(buffer, sizeof(buffer), "%02lu:%02lu", emergency_remaining / 60, emergency_remaining % 60);
+            mode_info = " [Проверка: " + std::string(buffer) + "]";
+          }
+          else {
+            uint32_t next_check_remaining = 0;
+            if (id(last_ventilation) != 0) {
+              uint32_t time_since_last = (now - id(last_ventilation)) / 1000;
+              next_check_remaining = (time_since_last < 20*60) ? (20*60 - time_since_last) : 0;
+            } 
+            else if (id(emergency_start_time) != 0) {
+              uint32_t time_since_emergency = (now - id(emergency_start_time)) / 1000;
+              next_check_remaining = (time_since_emergency < 20*60) ? (20*60 - time_since_emergency) : 0;
+            }
+            snprintf(buffer, sizeof(buffer), "%02lu:%02lu", next_check_remaining / 60, next_check_remaining % 60);
+            mode_info = " [Проверка через: " + std::string(buffer) + "]";
+          }
+        }
+      // Формируем основной статус
+        current_status = id(emergency_bypass) 
+          ? "Проверка дыма (" + std::to_string(static_cast<int>(id(fan_speed_sensor).state)) + "%)" + mode_info + " " + power_status
+          : "Задымление (" + std::to_string(static_cast<int>(id(fan_speed_sensor).state)) + "%)" + mode_info + " " + power_status;
+      }
+      // Ручной режим (четвертый приоритет)
+      else if (id(mode_select).state == "manual") {
+        current_status = "Ручной (" + std::to_string(static_cast<int>(id(fan_speed_sensor).state)) + "%) " + power_status;
+      }
+      // Полуавтомат/авто (низший приоритет)
+      else {
+        if (id(mode_select).state == "semi_auto") {
+          uint32_t elapsed_seconds = (millis() / 1000) - id(semi_auto_start_time);
+          uint32_t remaining = (elapsed_seconds < id(semi_auto_duration_sec)) 
+                              ? (id(semi_auto_duration_sec) - elapsed_seconds) 
+                              : 0;
+          char buffer[160];
+          snprintf(buffer, sizeof(buffer), 
+            "Полуавтоматический (%d%% / %02lu:%02lu) %s",
+            static_cast<int>(id(fan_speed_sensor).state),
+            remaining / 60,
+            remaining % 60,
+            power_status.c_str()
+          );
+          current_status = buffer;
+        }
+        else {
+          current_status = "Автоматический (" + std::to_string(static_cast<int>(id(fan_speed_sensor).state)) + "%) " + power_status;
+        }
+      }
+
+      if (current_status != last_status) {
+        last_status = current_status;
+        return current_status;
+      }
+      return {};
+    update_interval: never
+
+output:
+    # Реальный PWM выход
+  - platform: ledc
+    id: pwm_raw
+    pin: GPIO13
+    frequency: 1000 Hz
+
+    # Виртуальный выход с логикой разгона вентилятора и преобразованием 0-10V в 1-10V
+  - platform: template
+    id: pwm_output
+    type: float
+    write_action:
+      - lambda: |-
+          // Определение формата целевой скорости по режиму работы
+          float speed_percent = 0.0;
+          std::string current_mode = id(mode_select).state;
+
+          if (current_mode == "auto") {
+            speed_percent = id(auto_fan_speed).state; // Уже в процентах
+          } 
+          else if (current_mode == "manual") {
+            // Конвертируем 0.0-1.0 из fan в 0-100%
+            speed_percent = state * 100.0; 
+          }
+          else if (current_mode == "semi_auto") {
+            speed_percent = id(semi_auto_speed); // Уже в процентах
+          }
+          else {
+            speed_percent = 0.0;
+          }
+
+          // Логика управления состоянием
+          bool was_off = (id(fan_speed_percent) <= 0.0);
+
+          // Полный сброс при выключении
+          if (speed_percent <= 0) {
+            id(grace_period_active) = false;
+            id(speedup_active) = false;
+            id(last_requested_speed) = 0.0;
+            id(pwm_raw).set_level(0.0);
+            id(fan_speed_percent) = 0.0;
+            id(fan_speed_sensor).update();
+            ESP_LOGD("fan", "Fan OFF");
+            return;
+          }
+
+          // Активация Grace Period (защитный период) при старте
+          if (was_off) {
+            id(grace_period_active) = true;
+            id(grace_period_script).execute();
+            ESP_LOGD("fan", "Grace period STARTED");
+          }
+
+          // Обработка режима разгона
+          if (id(speedup_active)) {
+            // Сохраняем исходную скорость с учётом режима
+            if (current_mode == "auto" || current_mode == "semi_auto") {
+              id(last_requested_speed) = speed_percent;
+            } else {
+              id(last_requested_speed) = state * 100.0; // если установлена скорость в manual режиме
+            }
+            speed_percent = 15; // Фиксируем 15% на время разгона
+            ESP_LOGD("fan", "SPEEDUP: Holding 15%");
+          } 
+          else if (id(grace_period_active) && (speed_percent < 15)) {
+            id(speedup_active) = true;
+            id(speedup_script).execute();
+            id(last_requested_speed) = speed_percent;
+            speed_percent = 15;
+            ESP_LOGD("fan", "LOW SPEED: %d%%, Activating SPEEDUP", (int)speed_percent);
+          }
+
+          // Преобразование в напряжение 0-10В в 1-10В
+          float output_voltage;
+          if (speed_percent == 0) {
+              // Полное выключение при 0%
+              output_voltage = 0.0;
+          } else if (speed_percent <= 1) {
+              // Минимальное напряжение 1.1 В для 1%
+              output_voltage = 0.11; // 0.11 * 10 = 1.1 В
+          } else {
+              // Линейное преобразование 2-100% в 1.1-10 В
+              output_voltage = 0.11 + (speed_percent - 1) * (0.89 / 99.0);
+          }
+
+          // Применение к аппаратному выходу
+          id(pwm_raw).set_level(output_voltage);
+          id(fan_speed_percent) = speed_percent;
+          id(fan_speed_sensor).update();
+          id(fan_status).update();
+
+          ESP_LOGD("fan", 
+            "Mode: %s, Req: %.1f%%, Out: %.2fV", 
+            current_mode.c_str(),
+            speed_percent,
+            output_voltage * 10.0
+          );
+
+fan:
+  # Компонент для управления вентилятором в manual режиме с синхронизацией в auto и semi-auto
+  - platform: speed
+    name: "Manual Fan Control"
+    output: pwm_output
+    id: fan_controller
+    icon: mdi:fan-alert
+    speed_count: 100
+    on_speed_set: # Логика восстановления из auto_fan_speed при установке скорости в НЕ manual
+      then:
+        - if:
+            condition:
+              lambda: "return id(mode_select).state == \"manual\";"
+            then:
+              lambda: |-
+                id(last_requested_speed) = x;
+            else:
+              - lambda: |-
+                  // Определяем целевую скорость для текущего режима
+                  float target_speed = 0;
+                  if (id(mode_select).state == "auto") {
+                    target_speed = id(auto_fan_speed).state;
+                  } else if (id(mode_select).state == "semi_auto") {
+                    target_speed = id(semi_auto_speed);
+                  }
+
+                  // Если текущая скорость не совпадает с целевой - переопределяем
+                  if (id(fan_controller).speed != target_speed) {
+                    auto call = id(fan_controller).make_call();
+                    call.set_speed(target_speed);
+                    call.perform();
+                  }
+    on_turn_on:  # Логика восстановления состояния из auto_fan_speed при установке состояния включения в НЕ manual
+      then:
+        - if:
+            condition:
+              lambda: "return id(mode_select).state == \"manual\";"
+            then:
+              - fan.turn_on: fan_controller
+              - lambda: |-
+                  id(fan_status).update();  // Принудительное обновление
+            else:
+              - lambda: |-
+                  // Определяем целевую скорость для режима
+                  float target_speed = 0;
+                  if (id(mode_select).state == "auto") {
+                    target_speed = id(auto_fan_speed).state;
+                  } else if (id(mode_select).state == "semi_auto") {
+                    target_speed = id(semi_auto_speed);
+                  }
+
+                  // Атомарное включение с установкой скорости
+                  auto call = id(fan_controller).make_call();
+                  call.set_state(target_speed > 0);
+                  if (target_speed > 0) {
+                    call.set_speed(target_speed);
+                  }
+                  call.perform();
+    on_turn_off:  # Логика восстановления состояния из auto_fan_speed при установке состояния включения в НЕ manual
+      then:
+        - if:
+            condition:
+              lambda: "return id(mode_select).state == \"manual\";"
+            then:
+              - fan.turn_off: fan_controller
+              - lambda: |-
+                  id(fan_status).update();  // Принудительное обновление
+            else:
+              - lambda: |-
+                  // Повторно устанавливаем требуемое состояние
+                  float target_speed = 0;
+                  if (id(mode_select).state == "auto") {
+                    target_speed = id(auto_fan_speed).state;
+                  } else if (id(mode_select).state == "semi_auto") {
+                    target_speed = id(semi_auto_speed);
+                  }
+
+                  auto call = id(fan_controller).make_call();
+                  call.set_state(target_speed > 0);
+                  if (target_speed > 0) {
+                    call.set_speed(target_speed);
+                  }
+                  call.perform();
+
+interval:
+  # Счетчик режима полуавтомата
+  - id: semi_auto_timer
+    interval: 1s
+    then:
+      - lambda: |-
+          if (!id(semi_auto_active)) return;
+          
+          uint32_t now_sec = millis() / 1000;
+          uint32_t elapsed = now_sec - id(semi_auto_start_time);
+          
+          if (elapsed >= id(semi_auto_duration_sec)) {
+            auto call = id(mode_select).make_call();
+            call.set_option("auto");
+            call.perform();
+            id(semi_auto_active) = false;
+          }
+          id(fan_status).update();
+
+  # Таймер активности дисплея
+  - id: display_timeout_timer
+    interval: 1s
+    then:
+      - lambda: |-
+          if (id(display_active)) {
+            id(display_timeout_counter) += 1;
+            if (id(display_timeout_counter) >= 30) {
+              id(display_active) = false;
+              id(oled_display).update();
+              ESP_LOGD("DISPLAY", "Auto-off triggered");
+            }
+          }
+
+  # Активация вентиляции при аварийном режиме задымления
+  - id: ventilation_timer
+    interval: 1s
+    then:
+      - lambda: |-
+          unsigned long now = millis();
+          
+          if (id(smoke_emergency_sensor).state) {
+            // Первая активация при обнаружении аварии
+            if (id(emergency_start_time) == 0) {
+              id(emergency_start_time) = now;
+            }
+            
+            // Активация проветривания дыма в канале вентиляции каждые 20 мин (20*60*1000 мс) во время аварии
+            if (!id(emergency_bypass) && 
+                (now - id(last_ventilation)) >= (20*60*1000) &&
+                (now - id(emergency_start_time)) >= (20*60*1000)) {
+              id(emergency_bypass) = true;
+              id(last_ventilation) = now;
+              id(auto_fan_speed).update();
+            }
+            
+            if (id(emergency_bypass)) {
+              // Автоматическое отключение через 30 секунд
+              if ((now - id(last_ventilation)) >= 30*1000) {
+                id(emergency_bypass) = false;
+                id(auto_fan_speed).update();
+              }
+            }
+            id(fan_status).update();
+          } else {
+            // Сброс таймеров при отсутствии аварии
+            id(emergency_start_time) = 0;
+            id(emergency_bypass) = false;
+            id(auto_fan_speed).update();
+          }
+
+script:
+  # Таймер режима разгона
+  - id: speedup_script
+    mode: restart
+    then:
+      - delay: 10s
+      - lambda: |-
+          id(speedup_active) = false;
+          ESP_LOGD("fan", "SPEEDUP FINISHED. Restoring speed: %.1f%%", id(last_requested_speed));
+          // Конвертируем проценты в диапазон 0.0-1.0 для pwm_output
+          auto current_mode = id(mode_select).state;
+          float restored_speed = (current_mode == "manual") 
+            ? id(last_requested_speed) / 100.0  // Конвертация % → 0.0-1.0 для ручного режима
+            : id(last_requested_speed);         // Для auto/semi_auto оставляем как есть
+          id(pwm_output).set_level(restored_speed);
+          id(fan_status).update(); // Обновляю текстовый статус вентилятора
+
+  # Таймер Grace period (10 сек после старта)
+  - id: grace_period_script
+    mode: restart
+    then:
+      - delay: 10s
+      - lambda: |-
+          id(grace_period_active) = false;
+          id(fan_status).update(); // Обновляю текстовый статус вентилятора
+          ESP_LOGD("fan", "GRACE PERIOD ENDED");
