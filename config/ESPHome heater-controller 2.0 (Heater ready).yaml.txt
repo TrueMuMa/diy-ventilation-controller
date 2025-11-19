@@ -1,5 +1,5 @@
 substitutions:
-  version: "1_0"
+  version: "2_0"
 
 esphome:
   name: heater-ventilation-controller
@@ -825,3 +825,4 @@ script:
           id(power_current_level) = desired;
       - delay: 200ms
       - lambda: 'id(ssr_lock) = false;'
+
