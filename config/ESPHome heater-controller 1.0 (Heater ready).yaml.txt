@@ -1,0 +1,827 @@
+substitutions:
+  version: "1_0"
+
+esphome:
+  name: heater-ventilation-controller
+  friendly_name: heater-ventilation-controller
+  on_boot:
+    - delay: 1s
+    - lambda: |-
+        ESP_LOGW("BOOT", "Safe-boot: forcing heater OFF (relays, SSR, PID).");
+        // Форсируем выключение SSR и реле при старте системы
+        id(ssr_gpio).turn_off();
+        id(power_700).turn_off();
+        id(power_1200).turn_off();
+        // Гарантируем, что PID в OFF (чтобы slow_pwm не включил SSR)
+        auto call = id(pid_heater).make_call();
+        call.set_mode(climate::CLIMATE_MODE_OFF);
+        call.perform();
+        ESP_LOGI("BOOT", "Done: SSR/rels/ PID set to OFF. Awaiting explicit Modbus/HA command.");
+
+esp32:
+  board: esp32dev # Для плат ESP32
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "ваш_API_ключ" # Генерируется когда вы создаете новое устройство в ESPHome
+
+ota:
+  - platform: esphome
+    password: "пароль_ota_обновлений"  # Генерируется когда вы создаете новое устройство в ESPHome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+captive_portal:
+
+globals:
+  - id: fault_flag # Флаг аварийной защиты
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Для обработчика ступеней нагрева
+  - id: power_current_level # Текущая конфигурация реле мощности
+    type: int
+    initial_value: '0' # 0, 700, 1200, 1900
+  - id: power_next_level  # Следующая конфигурация реле (используется скриптом)
+    type: int
+    initial_value: '0'
+  - id: ssr_lock  # Флаг блокировки SSR на время переключения механических реле
+    type: bool
+    initial_value: 'false'
+
+  # Для отслеживания работы вентилятора и нештатного обрыва Modbus
+  - id: fan_last_seen_ms # Последняя запись данных от master
+    type: unsigned long
+    initial_value: '0'
+  - id: fan_rpm  # Обороты вентилятора
+    type: int
+    initial_value: '0'
+  - id: fan_binary  # Флаг работы вентилятора
+    type: bool
+    initial_value: 'false'
+  - id: operating_allowed  # Флаг разрешения работы вентилятора
+    type: bool
+    initial_value: 'false'
+
+  # Хранение PID сигнала (для настройки PID) и расчета обротов вентилятора
+  - id: pid_output_percent
+    type: uint8_t
+    restore_value: no
+    initial_value: '255'  # 255 = "No data"
+
+  # Для работы дисплея
+  - id: display_active # Флаг активности встроенного дисплея
+    type: bool
+    initial_value: 'true'
+  - id: display_timeout_counter # Остаток времени до отключения дисплея
+    type: int
+    initial_value: '0'
+
+# Добавляем шрифты для дисплея (если его нет - удалите)
+font:
+  - file: "gfonts://Roboto+Mono"
+    id: font_large
+    size: 16
+    glyphs: " !%()+-.:/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°|" 
+  - file: "gfonts://Roboto+Mono"
+    id: font_medium
+    size: 14
+    glyphs: " !%()+-.:/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°|"
+  - file: "gfonts://Roboto+Mono"
+    id: font_small
+    size: 12
+    glyphs: " !%()+-.:/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°|"
+
+# Дисплей SSD1306 (если его нет - удалите)
+display:
+  - platform: ssd1306_i2c
+    id: oled_display
+    model: "SSD1306 128x64"
+    address: 0x3C
+    lambda: |-
+      if (id(display_active)) {
+        // Вычисляем доступную мощность
+        int available_power = 0;
+        if (id(power_700).state) available_power += 700;
+        if (id(power_1200).state) available_power += 1200;
+        
+        // Определяем текстовое представление режима
+        const char* mode_text = "OFF";
+        if (available_power == 700) mode_text = "700W";
+        else if (available_power == 1200) mode_text = "1200W";
+        else if (available_power == 1900) mode_text = "1900W";
+
+        // Строка 1: Режим работы
+        it.printf(0, 0, id(font_medium), "Mode: %s", mode_text);
+
+        // Строка 2: Температуры
+        it.printf(0, 16, id(font_small), "SV:%.1f°C", id(pid_heater).target_temperature);
+        it.printf(64, 16, id(font_small), "|PV:%.1f°C", id(temp_ds18).state);
+
+        // Строка 3: Мощность и напряжение
+        it.printf(0, 32, id(font_small), "Pow:%.0fW", id(pzem_power).state);
+        it.printf(64, 32, id(font_small), "|%.1fV", id(pzem_voltage).state);
+
+        // Строка 4: Статусы
+        // Мигающий индикатор SSR с использованием глобального интервала
+        static uint32_t last_blink = 0;
+        static bool blink_state = false;
+        if (millis() - last_blink > 500) {  // Мигание каждые 500 мс
+          blink_state = !blink_state;
+          last_blink = millis();
+        }
+        const char* ssr_indicator = id(ssr_gpio).state ? (blink_state ? "*" : " ") : " ";
+        
+        // Статус аварии
+        const char* fault_status = id(fault_flag) ? "OvH!" : "OK";
+        
+        // Статус разрешения работы (operating_allowed)
+        const char* operating_status = id(operating_allowed) ? "Ready" : "NotRd";
+
+        // Компактное размещение статусов с разделителями
+        it.printf(0, 48, id(font_small), "S:%s F:%s", ssr_indicator, fault_status);
+        it.printf(64, 48, id(font_small), "Op:%s", operating_status);
+      } else {
+        it.clear();
+      }
+    update_interval: 500ms
+
+# Шина I2C для дисплея SSD1306 (если его нет - удалите)
+i2c:
+  - id: i2c_bus
+    sda: GPIO21
+    scl: GPIO22
+    scan: false
+
+# Шина 1-wire для основного датчика температуры DS18B20 (Dallas)
+one_wire:
+  - platform: gpio
+    pin: GPIO32
+
+# Пины UARTов
+uart:
+  - id: uart_pzem
+    rx_pin: GPIO16
+    tx_pin: GPIO17
+    baud_rate: 9600
+    stop_bits: 1
+  - id: uart_master
+    rx_pin: GPIO18
+    tx_pin: GPIO19
+    baud_rate: 9600
+
+# Конфигурация modbus
+modbus:
+  - id: modbus_pzem
+    uart_id: uart_pzem
+    send_wait_time: 500ms
+  - id: modbus_server
+    uart_id: uart_master
+    role: server
+
+# Контроллер нагревателя Modbus (slave-устройство)
+modbus_controller:
+  # В server_registers задаём регистры, доступные мастеру.
+  - id: ventilation_heater
+    modbus_id: modbus_server
+    address: 0x01
+    server_registers:
+      # Температура DS18B20 (FP32, два регистра)
+      - address: 0x0000
+        value_type: FP32
+        read_lambda: |-
+          return id(temp_ds18).state;
+      # Ток PZEM-004T (FP32)
+      - address: 0x0002
+        value_type: FP32
+        read_lambda: |-
+          return id(pzem_current).state;
+      # Напряжение PZEM-004T (FP32)
+      - address: 0x0004
+        value_type: FP32
+        read_lambda: |-
+          return id(pzem_voltage).state;
+      # Мощность PZEM-004T (FP32)
+      - address: 0x0006
+        value_type: FP32
+        read_lambda: |-
+          return id(pzem_power).state;
+      # Энергия PZEM-004T (FP32)
+      - address: 0x0008
+        value_type: FP32
+        read_lambda: |-
+          return id(pzem_energy).state;
+
+      # Регистр статуса: мощность (2 бита), авария, разрешение работы (бит 3) и PID сигнал в старшем байте
+      - address: 0x000A
+        value_type: U_WORD
+        read_lambda: |-
+          uint16_t status = 0;
+          // код мощности (младшие 2 бита)
+          if (id(power_700).state && id(power_1200).state) {
+            status |= 0b11;  // 1900 Вт
+          } else if (id(power_1200).state) {
+            status |= 0b10;  // 1200 Вт
+          } else if (id(power_700).state) {
+            status |= 0b01;  // 700 Вт
+          } // иначе 0
+
+          // авария -> бит 2
+          if (id(fault_flag)) {
+            status |= 1 << 2;
+          }
+
+          // разрешение работы -> бит 3
+          if (!id(operating_allowed)) {
+            status |= 1 << 3;
+          }
+
+          // уровень сигнала PID (берём из globals)
+          uint8_t pct_byte = id(pid_output_percent);
+          status |= ((uint16_t)pct_byte << 8);
+          return status;
+
+       # Регистр: включение/выключение PID (0 = OFF, 1 = ON)
+      - address: 0x000B
+        value_type: U_WORD
+        read_lambda: |-
+          return id(pid_heater).mode == climate::CLIMATE_MODE_OFF ? 0 : 1;
+        write_lambda: |-
+          // Запрещаем включение при аварии
+          if (id(fault_flag)) {
+            ESP_LOGW("modbus", "PID enable/disable ignored due to FAULT");
+            return false;
+          }
+          // Запрещаем включение если вентилятор не работает
+          if (!id(operating_allowed)) {
+            ESP_LOGW("modbus", "PID enable/disable ignored: operation not allowed (fan)");
+            return false;
+          }
+
+          if ((int)x == 0) {
+            ESP_LOGI("modbus", "PID disabled via Modbus");
+            auto call_off = id(pid_heater).make_call();
+            call_off.set_mode(climate::CLIMATE_MODE_OFF);
+            call_off.perform();
+          } else {
+            ESP_LOGI("modbus", "PID enabled via Modbus");
+            auto call_on = id(pid_heater).make_call();
+            call_on.set_mode(climate::CLIMATE_MODE_HEAT);
+            call_on.perform();
+          }
+          return true;
+
+      # Целевая температура нагревателя PID (FP32, два регистра)
+      - address: 0x000C
+        value_type: FP32
+        read_lambda: |-
+          return id(pid_heater).target_temperature;
+        write_lambda: |-
+          auto call = id(pid_heater).make_call();
+          call.set_target_temperature(x);
+          call.perform();
+          return true;
+
+      # Сброс счетчика энергии
+      - address: 0x000D
+        value_type: U_WORD
+        read_lambda: |-
+          return (uint16_t)0;
+        write_lambda: |-
+          uint16_t v = (uint16_t) llround(x);
+          static unsigned long arm_ms = 0;
+          static unsigned long last_reset_ms = 0;
+          unsigned long now = millis();
+
+          // ARM
+          if (v == 0x5A5A) {
+            arm_ms = now;
+            ESP_LOGI("modbus_reset", "ARM received (0x5A5A). Armed for 30s.");
+            return true;
+          }
+
+          // FIRE
+          if (v == 0xA5A5) {
+            const unsigned long ARM_WINDOW_MS = 10000UL; // 10s окно для подтверждения
+            if (arm_ms == 0 || (now - arm_ms) > ARM_WINDOW_MS) {
+              ESP_LOGW("modbus_reset", "Reset ignored: not armed or arm expired.");
+              return true;
+            }
+            last_reset_ms = now;
+            arm_ms = 0;
+            ESP_LOGI("modbus_reset", "Reset CONFIRMED. Executing ResetEnergyAction.");
+            esphome::pzemac::ResetEnergyAction<> action(id(pzem_sensor));
+            action.play();
+            return true;
+          }
+
+          ESP_LOGW("modbus_reset", "Ignored write to 0x000D with value=0x%04X", v);
+          return true;
+
+      # Регистр для получения статуса вентилятора от Master (контроллер вентилятора)
+      - address: 0x000E
+        value_type: U_WORD
+        write_lambda: |-
+          uint16_t raw = (uint16_t)x;
+          // Извлекаем флаг работы и RPM
+          bool bin = (raw >> 15) & 0x01;
+          uint16_t rpm = raw & 0x7FFF;
+          // Сохраняем значения в глобальные переменные
+          id(fan_rpm) = (int)rpm;
+          id(fan_binary) = bin;
+          id(fan_last_seen_ms) = millis();
+          ESP_LOGI("modbus", "Fan status update: binary=%d, rpm=%u (ts_ms=%lu)", bin ? 1 : 0, rpm, id(fan_last_seen_ms));
+          return true;
+
+        read_lambda: |-
+          // Возвращаем последнее известное значение в том же формате (bit15=bin, bits0-14=rpm)
+          uint16_t out = ((id(fan_binary) ? 1 : 0) << 15) | (id(fan_rpm) & 0x7FFF);
+          return out;
+
+sensor:
+# Температура ESP32
+  - platform: internal_temperature
+    name: "ESP32 core temp"
+
+  # Датчик температуры DS18B20 с логикой аварии
+  - platform: dallas_temp
+    name: "DS18B20 Temperature"
+    id: temp_ds18
+    accuracy_decimals: 1
+    resolution: 11
+    unit_of_measurement: "°C"
+    update_interval: 3s
+    icon: mdi:thermometer
+    filters:
+      - filter_out: 0.0
+      - median:
+          window_size: 3
+          send_every: 1
+          send_first_at: 1
+      - sliding_window_moving_average:
+          window_size: 3
+          send_every: 1
+    on_value:
+      then:
+        - lambda: |-
+            float t = x;
+            // Триггер аварии: либо явный перегрев, либо отсутствие датчика (NaN)
+            if (std::isnan(t) || t >= 50.0) {
+              if (!id(fault_flag)) {
+                ESP_LOGW("safety", "Bad sensor or overtemperature: %.1f C -> trip", t);
+                id(fault_flag) = true;
+                id(ssr_gpio).turn_off();
+                id(power_700).turn_off();
+                id(power_1200).turn_off();
+                auto c = id(pid_heater).make_call();
+                c.set_mode(climate::CLIMATE_MODE_OFF);
+                c.perform();
+              }
+              return;
+            }
+            // Сброс аварии — только по валидному низкому показанию <=45
+            if (t <= 45.0) {
+              if (id(fault_flag)) {
+                ESP_LOGI("safety", "Clear fault: temp=%.1f°C <=45.", t);
+                id(fault_flag) = false;
+              }
+            }
+
+  # Выходное значение PID
+  - platform: pid
+    name: "PID Output"
+    type: RESULT
+    id: pid_output
+    climate_id: pid_heater
+
+  # Текущие коэффициенты PID термостата (для отладки если необходимо)
+  - platform: pid
+    name: "Current KP"
+    type: KP
+    climate_id: pid_heater
+    unit_of_measurement: ""
+  - platform: pid
+    name: "Current KI"
+    type: KI
+    climate_id: pid_heater
+    unit_of_measurement: ""
+  - platform: pid
+    name: "Current KD"
+    type: KD
+    climate_id: pid_heater
+    unit_of_measurement: ""
+
+  # PZEM-004T датчик
+  - platform: pzemac
+    id: pzem_sensor
+    modbus_id: modbus_pzem
+    update_interval: 10s
+    address: 0x01
+    current:
+      name: "Current"
+      id: pzem_current
+      accuracy_decimals: 1
+      device_class: current
+    voltage:
+      name: "AC Voltage"
+      id: pzem_voltage
+      accuracy_decimals: 1
+      device_class: voltage
+    power:
+      name: "Electrical Power"
+      id: pzem_power
+      accuracy_decimals: 0
+      device_class: power
+      unit_of_measurement: W
+    energy:
+      name: "Energy"
+      id: pzem_energy
+      accuracy_decimals: 0
+      device_class: energy
+      unit_of_measurement: Wh
+      state_class: total_increasing
+
+# Управление реле и SSR (GPIO13, GPIO14, GPIO25)
+switch:
+  - platform: gpio
+    id: power_700
+    pin: GPIO13
+    inverted: true
+    internal: true
+    name: "Power 700W"
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: gpio
+    id: power_1200
+    pin: GPIO14
+    inverted: true
+    internal: true
+    name: "Power 1200W"
+    restore_mode: RESTORE_DEFAULT_OFF
+# SSR
+  - platform: gpio
+    id: ssr_gpio
+    pin: GPIO25
+    internal: true
+    name: "SSR GPIO"
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# Основной термостат
+climate:
+  - platform: pid
+    name: "Target temp"
+    id: pid_heater
+    sensor: temp_ds18
+    default_target_temperature: 25
+    heat_output: pid_output_processor
+    control_parameters:
+      kp: 0.075 # коэффициенты зависят от многих факторов
+      ki: 0.001 # частоты обновления датчика температуры, мощности нагрева, потока воздуха
+      kd: 3.5 # и главное положения датчика температуры в канале. Оптимально располагать его в центре трубы, но не вверху или внизу
+      output_averaging_samples: 8
+      derivative_averaging_samples: 3
+    deadband_parameters:
+      threshold_high: 0.1°C
+      threshold_low: -0.1°C
+
+output:
+# Виртуальный выход с ограничениями длительности импульсов не менее 1 сек (защита SSR и PTC)
+  - platform: template
+    id: pid_output_processor
+    type: float
+    write_action:
+      - lambda: |-
+          // Если идёт переключение реле — держим SSR выключенным.
+          if (id(ssr_lock)) {
+            id(heater_pwm).set_level(0.0f);
+            // отражаем фактический уровень — 0%
+            id(pid_output_percent) = (uint8_t)0;
+            return;
+          }
+          float raw = id(pid_heater).get_output_value();
+          // Проверим, был ли raw валидным (чтобы в глобал писать 255 при "нет данных")
+          bool raw_valid = !(std::isnan(raw) || !std::isfinite(raw));
+
+          // При NaN/inf приводим к 0.0f физически
+          if (!raw_valid) {
+            raw = 0.0f;
+          }
+
+          const float MIN_FRAC = 0.10f;  // Минимальное время работы реле в цикле (1 сек)
+          const float MAX_FRAC = 0.90f;  // Минимальное время работы реле в цикле (9 сек)
+          float final_level = 0.0f;
+
+          // Ограничение диапазона с учетом особых случаев 0% и 100%
+          if (raw <= 0.0f) {
+            // Полный ноль
+            final_level = 0.0f;
+          } else if (raw < 0.05f) {
+            // Меньше 5% считаем нулём
+            final_level = 0.0f;
+          } else if (raw < MIN_FRAC) {
+            // От 5% до 10% приравниваем к 10%
+            final_level = MIN_FRAC;
+          } else {
+            // Ограничение диапазона 10–90%
+            if (raw > MAX_FRAC) raw = MAX_FRAC;
+            // Дополнительно клэмпим в диапазон 0..1
+            if (raw < 0.0f) raw = 0.0f;
+            if (raw > 1.0f) raw = 1.0f;
+            final_level = raw;
+          }
+
+          // Применяем к физическому выходу
+          id(heater_pwm).set_level(final_level);
+
+          // Записываем в globals: если исходный raw невалиден — 255 (No data),
+          // иначе целый процент 0..100
+          if (!raw_valid) {
+            id(pid_output_percent) = (uint8_t)255;
+          } else {
+            int pct = (int)roundf(final_level * 100.0f);
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+            id(pid_output_percent) = (uint8_t)pct;
+          }
+
+# Физический выход на SSR реле
+  - platform: slow_pwm
+    id: heater_pwm
+    period: 10s # Время цикла!
+    turn_on_action:
+      - lambda: |-
+          // Проверка аварии в момент включения
+          if (id(fault_flag)) return;
+          if (!id(power_700).state && !id(power_1200).state) return;
+          if (id(pid_heater).mode == climate::CLIMATE_MODE_OFF) return;
+          id(ssr_gpio).turn_on();
+    turn_off_action:
+      - lambda: |-
+          id(ssr_gpio).turn_off();
+
+button:
+# Кнопка автотьюна PIDов. Очень полезна для настройки. Результаты коэффициентов смотрите в логах
+  - platform: template
+    name: "PID Autotune"
+    on_press:
+      - climate.pid.autotune: pid_heater
+
+# Сброс счетчика энергии вручную. Уберите если не нужно
+  - platform: template
+    name: "Manual Energy Reset"
+    icon: "mdi:restart"
+    on_press:
+      - lambda: |-
+          esphome::pzemac::ResetEnergyAction<> action(id(pzem_sensor));
+          action.play();
+
+# Кнопка активации дисплея
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO23
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Display Activation Button"
+    internal: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      then:
+        - lambda: |-
+            id(display_timeout_counter) = 0;
+            id(display_active) = true;
+            id(oled_display).update();
+
+# Отладочные индикаторы реле и флагов, можно убрать после отладки
+  - platform: template
+    name: "Relay 700 State"
+    lambda: |-
+      return id(power_700).state;
+    icon: "mdi:power-plug"
+
+  - platform: template
+    name: "Relay 1200 State"
+    lambda: |-
+      return id(power_1200).state;
+    icon: "mdi:power-plug"
+
+  - platform: template
+    name: "SSR State"
+    lambda: |-
+      return id(ssr_gpio).state;
+    icon: "mdi:flash"
+
+  - platform: template
+    name: "Operating Allowed"
+    lambda: |-
+      return !id(operating_allowed);
+    device_class: safety
+
+  - platform: template
+    name: "Overheat"
+    lambda: |-
+      return id(fault_flag);
+    device_class: problem
+
+# Таймер для автоматического отключения дисплея
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(display_active)) {
+            id(display_timeout_counter) += 1;
+            if (id(display_timeout_counter) >= 30) {
+              id(display_active) = false;
+              id(oled_display).update();
+            }
+          }
+
+# Основной обработчик мощности нагревателя (подключение реле)
+  - interval: 1s
+    then:
+      - lambda: |-
+          // --- Константы / настройки ---
+          static const unsigned long FAN_STALE_MS = 20000UL;   // 20 s: последнее допустимое обновление данных вентилятора
+          static const uint8_t FAN_MIN_RPM = 400;            // минимальные обороты вентилятора для разрешения нагрева
+          static const float AVG_WINDOW_S = 180.0f;            // EWMA окно (секунды) — среднее по PID
+
+          // Асимметричные выдержки (секунды)
+          static unsigned long min_dwell_up_s = 120UL;         // минимальное время между повышениям
+          static unsigned long min_dwell_down_s = 180UL;       // минимальное время между понижениями
+
+          // Состояние (static чтобы сохранялось между вызовами)
+          static int pid_prev_mode = 0;                        // 0 = PID OFF, 1 = PID ON
+          static float pid_avg_frac = 0.0f;                    // EWMA среднее для PID (0..1)
+          static unsigned long last_stage_change_s = 0;        // время (s) последней смены ступени
+
+          // --- Время ---
+          unsigned long now_ms = millis();
+          unsigned long now_s = now_ms / 1000UL;
+
+          // --- Проверка вентилятора / связи ---
+          bool fan_ok = true;
+          unsigned long last_ms = (unsigned long) id(fan_last_seen_ms);
+          if (last_ms == 0) {
+            fan_ok = false;
+          } else if ((now_ms - last_ms) > FAN_STALE_MS) {
+            fan_ok = false;
+          } else if (!id(fan_binary) || id(fan_rpm) < FAN_MIN_RPM) {
+            fan_ok = false;
+          }
+          id(operating_allowed) = fan_ok;
+
+          if (!fan_ok) {
+            // отключаем PID и ступени безопасно
+            if (id(pid_heater).mode != climate::CLIMATE_MODE_OFF) {
+              auto call = id(pid_heater).make_call();
+              call.set_mode(climate::CLIMATE_MODE_OFF);
+              call.perform();
+              ESP_LOGI("fan_check", "Heater PID turned OFF due to fan_check");
+            }
+            if (id(power_current_level) != 0) {
+              id(power_next_level) = 0;
+              id(apply_relay_stage_change).execute();
+            }
+            return;
+          }
+
+          // --- Аварийное отключение ---
+          if (id(fault_flag)) {
+            id(power_next_level) = 0;
+            id(apply_relay_stage_change).execute();
+            pid_prev_mode = 0;
+            ESP_LOGW("power_ctrl", "FAULT: scheduled safe OFF (script)");
+            return;
+          }
+
+          // --- Чтение текущего режима PID ---
+          int pid_mode = (id(pid_heater).mode == climate::CLIMATE_MODE_OFF) ? 0 : 1;
+
+          // При переходе OFF->ON — стартовая ступень 700W
+          if (pid_mode == 1 && pid_prev_mode == 0) {
+            ESP_LOGI("power_ctrl", "PID OFF->ON: startup -> scheduling 700W (safe)");
+            id(power_next_level) = 700;
+            id(apply_relay_stage_change).execute();
+            pid_prev_mode = pid_mode;
+            last_stage_change_s = now_s;
+            return;
+          }
+
+          // При выключении PID — выключаем всё
+          if (pid_mode == 0) {
+            if (id(power_current_level) != 0) {
+              ESP_LOGI("power_ctrl", "PID OFF: scheduling all power OFF (safe)");
+              id(power_next_level) = 0;
+              id(apply_relay_stage_change).execute();
+            }
+            id(power_current_level) = 0;
+            pid_prev_mode = pid_mode;
+            last_stage_change_s = now_s;
+            return;
+          }
+
+          // --- Чтение значения PID и нормализация значений ---
+          float frac_raw = id(pid_heater).get_output_value();
+          if (isnan(frac_raw)) frac_raw = 0.0f;
+          float frac = frac_raw;
+          if (frac_raw > 2.0f) frac = frac_raw / 100.0f; // поддержка 0..100 -> 0..1
+
+          // --- обновляем EWMA ---
+          const float alpha = 1.0f / AVG_WINDOW_S;
+          pid_avg_frac = pid_avg_frac * (1.0f - alpha) + frac * alpha;
+
+          // --- Текущий уровень мощности ---
+          int current_level = id(power_current_level);
+          if (current_level == 0) {
+            ESP_LOGI("power_ctrl", "PID already ON but current_level==0 -> scheduling 700W startup (safe)");
+            id(power_next_level) = 700;
+            id(apply_relay_stage_change).execute();
+            pid_prev_mode = pid_mode;
+            last_stage_change_s = now_s;
+            return;
+          }
+
+          // ===== Средние значения PID для переходов между ступенями =====
+          const float UP_700_1200 = 0.35f;
+          const float DOWN_1200_700 = 0.20f;
+          const float UP_1200_1900 = 0.95f;
+          const float DOWN_1900_1200 = 0.25f;
+
+          int desired_level = current_level;
+          if (current_level == 700) {
+            if (pid_avg_frac >= UP_700_1200) desired_level = 1200;
+          } else if (current_level == 1200) {
+            if (pid_avg_frac >= UP_1200_1900) desired_level = 1900;
+            else if (pid_avg_frac <= DOWN_1200_700) desired_level = 700;
+            else desired_level = 1200;
+          } else if (current_level == 1900) {
+            if (pid_avg_frac <= DOWN_1900_1200) desired_level = 1200;
+            else desired_level = 1900;
+          } else {
+            // fallback: приводим к ближайшей ступени
+            if (pid_avg_frac >= UP_1200_1900) desired_level = 1900;
+            else if (pid_avg_frac >= UP_700_1200) desired_level = 1200;
+            else desired_level = 700;
+          }
+
+          // минимальные выдержки: разные для повышения и понижения
+          bool is_increase = (desired_level > current_level);
+          unsigned long needed = is_increase ? min_dwell_up_s : min_dwell_down_s;
+          bool enough_time = ((now_s - last_stage_change_s) >= needed);
+
+          if (desired_level != current_level) {
+            if (id(ssr_lock)) {
+              ESP_LOGD("power_ctrl", "Change to %d deferred: ssr_lock active (script)", desired_level);
+            } else if (!enough_time) {
+              ESP_LOGD("power_ctrl", "Change to %d deferred: dwell not elapsed (need %lud s)", desired_level, needed);
+            } else {
+              ESP_LOGI("power_ctrl", "Scheduling change %d -> %d (pid_avg=%.3f, raw=%.3f)", current_level, desired_level, pid_avg_frac, frac);
+              id(power_next_level) = desired_level;
+              id(apply_relay_stage_change).execute();
+              last_stage_change_s = now_s;
+            }
+          }
+
+          // обновим prev-mode
+          pid_prev_mode = pid_mode;
+
+script:
+   # Скрипт установки реле в зависимости от мощности (с защитой от включения нагрузки)
+  - id: apply_relay_stage_change
+    mode: queued
+    max_runs: 1
+    then:
+      - lambda: 'id(ssr_lock) = true;'
+      - output.set_level:
+          id: heater_pwm
+          level: 0.0
+      - delay: 700ms
+      - lambda: |-
+          int desired = id(power_next_level);
+          if (desired == 0) {
+            id(power_700).turn_off();
+            id(power_1200).turn_off();
+          } else if (desired == 700) {
+            id(power_700).turn_on();
+            id(power_1200).turn_off();
+          } else if (desired == 1200) {
+            id(power_700).turn_off();
+            id(power_1200).turn_on();
+          } else if (desired == 1900) {
+            id(power_700).turn_on();
+            id(power_1200).turn_on();
+          }
+          id(power_current_level) = desired;
+      - delay: 200ms
+      - lambda: 'id(ssr_lock) = false;'
